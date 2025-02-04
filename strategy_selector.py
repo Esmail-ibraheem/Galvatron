@@ -19,6 +19,7 @@ import torch.nn as nn
 import torch.optim as optim
 from collections import deque
 import random
+import torch.nn.functional as F
 
 # Configure logging
 logging.basicConfig(
@@ -599,8 +600,288 @@ class StrategyMonitor:
     def _apply_strategy(self, strategy: Dict):
         """Apply the selected parallelism strategy."""
         logger.info(f"Applying new strategy: {strategy}")
-        # Implementation depends on your parallelism manager
-        pass
+        
+        # Create new ParallelismConfig from strategy
+        new_config = ParallelismConfig(
+            strategy_type=strategy['type'],
+            data_parallel_size=strategy.get('data_parallel_size', 1),
+            tensor_parallel_size=strategy.get('tensor_parallel_size', 1),
+            pipeline_parallel_size=strategy.get('pipeline_parallel_size', 1),
+            micro_batch_size=strategy.get('micro_batch_size', 1),
+            gradient_accumulation_steps=strategy.get('gradient_accumulation_steps', 1),
+            pipeline_chunks=strategy.get('pipeline_chunks', 8),
+            zero_optimization_stage=strategy.get('zero_stage', 0),
+            activation_checkpointing=strategy.get('activation_checkpointing', False),
+            activation_checkpoint_layers=strategy.get('checkpoint_layers', []),
+            cpu_offload=strategy.get('cpu_offload', False),
+            communication_overlap=strategy.get('communication_overlap', True)
+        )
+        
+        # Validate the new configuration
+        try:
+            new_config.validate(torch.cuda.device_count())
+        except ValueError as e:
+            logger.error(f"Invalid strategy configuration: {e}")
+            return False
+            
+        # Initialize new process groups
+        if self.process_groups is not None:
+            old_groups = self.process_groups
+            try:
+                self.process_groups = ProcessGroup(dist.get_world_size(), new_config)
+            except Exception as e:
+                logger.error(f"Failed to initialize new process groups: {e}")
+                self.process_groups = old_groups
+                return False
+                
+        # Apply configuration changes
+        if hasattr(self, 'parallelism_manager'):
+            try:
+                # Save model state
+                old_state = self.parallelism_manager.model.state_dict()
+                
+                # Apply new configuration
+                self.parallelism_manager.reconfigure(
+                    new_config,
+                    self.process_groups,
+                    preserve_state=True,
+                    old_state=old_state
+                )
+                
+                # Update current configuration
+                self.current_config = new_config
+                
+                # Log strategy change
+                self._log_strategy_change(new_config)
+                
+                # Record timestamp of change
+                self.strategy_changes.append((time.time(), new_config))
+                
+                logger.info("Successfully applied new parallelism strategy")
+                return True
+                
+            except Exception as e:
+                logger.error(f"Failed to apply new strategy: {e}")
+                # Attempt to rollback to previous state
+                try:
+                    self.parallelism_manager.model.load_state_dict(old_state)
+                    logger.info("Successfully rolled back to previous state")
+                except:
+                    logger.error("Failed to rollback to previous state")
+                return False
+        else:
+            logger.error("No parallelism manager available")
+            return False
+
+class DecisionTransformerStrategy:
+    """Decision Transformer implementation for dynamic parallelism strategy selection."""
+    
+    def __init__(self, 
+                 state_dim: int,
+                 action_dim: int,
+                 max_seq_length: int = 20,
+                 hidden_size: int = 512,
+                 n_layer: int = 4,
+                 n_head: int = 8,
+                 dropout: float = 0.1):
+        super().__init__()
+        
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.max_seq_length = max_seq_length
+        
+        # Embeddings
+        self.state_encoder = nn.Linear(state_dim, hidden_size)
+        self.action_encoder = nn.Linear(action_dim, hidden_size)
+        self.reward_encoder = nn.Linear(1, hidden_size)
+        
+        # Positional embeddings
+        self.pos_embedding = nn.Parameter(torch.zeros(1, max_seq_length, hidden_size))
+        
+        # Transformer layers
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=hidden_size,
+            nhead=n_head,
+            dim_feedforward=4 * hidden_size,
+            dropout=dropout,
+            activation='gelu',
+            batch_first=True
+        )
+        self.transformer = nn.TransformerEncoder(encoder_layer, n_layer)
+        
+        # Output heads
+        self.action_predictor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, action_dim)
+        )
+        
+        self.state_predictor = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, state_dim)
+        )
+        
+        # Optimization
+        self.optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=1e-4,
+            weight_decay=1e-4
+        )
+        
+    def forward(self, 
+                states: torch.Tensor,
+                actions: torch.Tensor,
+                rewards: torch.Tensor,
+                targets: Optional[torch.Tensor] = None,
+                attention_mask: Optional[torch.Tensor] = None) -> Dict[str, torch.Tensor]:
+        """
+        Forward pass of the Decision Transformer.
+        
+        Args:
+            states: Tensor of shape (batch_size, seq_len, state_dim)
+            actions: Tensor of shape (batch_size, seq_len, action_dim)
+            rewards: Tensor of shape (batch_size, seq_len, 1)
+            targets: Optional target tensor for supervised training
+            attention_mask: Optional mask for padding
+            
+        Returns:
+            Dictionary containing predicted actions and states
+        """
+        batch_size, seq_length = states.shape[0], states.shape[1]
+        
+        # Encode inputs
+        state_embeddings = self.state_encoder(states)
+        action_embeddings = self.action_encoder(actions)
+        reward_embeddings = self.reward_encoder(rewards)
+        
+        # Combine embeddings
+        sequence = torch.stack(
+            [state_embeddings, action_embeddings, reward_embeddings],
+            dim=2
+        ).reshape(batch_size, 3 * seq_length, -1)
+        
+        # Add positional embeddings
+        sequence = sequence + self.pos_embedding[:, :sequence.shape[1]]
+        
+        # Create attention mask if needed
+        if attention_mask is None:
+            attention_mask = torch.ones(
+                (batch_size, sequence.shape[1]),
+                dtype=torch.bool,
+                device=sequence.device
+            )
+        
+        # Transform sequence
+        transformed = self.transformer(
+            sequence,
+            src_key_padding_mask=~attention_mask
+        )
+        
+        # Predict next actions and states
+        action_preds = self.action_predictor(
+            transformed[:, 1::3]  # Select action positions
+        )
+        
+        state_preds = self.state_predictor(
+            transformed[:, 0::3]  # Select state positions
+        )
+        
+        return {
+            'action_preds': action_preds,
+            'state_preds': state_preds
+        }
+    
+    def get_action(self, 
+                   states: torch.Tensor,
+                   actions: torch.Tensor,
+                   rewards: torch.Tensor,
+                   target_return: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        Get action prediction for the next timestep.
+        
+        Args:
+            states: History of states (batch_size, seq_len, state_dim)
+            actions: History of actions (batch_size, seq_len, action_dim)
+            rewards: History of rewards (batch_size, seq_len, 1)
+            target_return: Optional target return for optimization
+            
+        Returns:
+            Predicted action for the next timestep
+        """
+        predictions = self.forward(states, actions, rewards)
+        return predictions['action_preds'][:, -1]  # Return last prediction
+    
+    def train_step(self, 
+                   batch: Dict[str, torch.Tensor],
+                   target_return: Optional[torch.Tensor] = None) -> Dict[str, float]:
+        """
+        Perform one training step.
+        
+        Args:
+            batch: Dictionary containing:
+                - states: (batch_size, seq_len, state_dim)
+                - actions: (batch_size, seq_len, action_dim)
+                - rewards: (batch_size, seq_len, 1)
+                - next_states: (batch_size, seq_len, state_dim)
+            target_return: Optional target return for optimization
+            
+        Returns:
+            Dictionary of losses
+        """
+        predictions = self.forward(
+            batch['states'],
+            batch['actions'],
+            batch['rewards']
+        )
+        
+        # Compute losses
+        action_loss = F.mse_loss(
+            predictions['action_preds'][:, :-1],
+            batch['actions'][:, 1:]
+        )
+        
+        state_loss = F.mse_loss(
+            predictions['state_preds'][:, :-1],
+            batch['next_states'][:, 1:]
+        )
+        
+        # Optional return-conditioning loss
+        return_loss = 0
+        if target_return is not None:
+            return_loss = F.mse_loss(
+                predictions['state_preds'][:, -1],
+                target_return
+            )
+        
+        # Total loss
+        total_loss = action_loss + state_loss + 0.1 * return_loss
+        
+        # Optimization step
+        self.optimizer.zero_grad()
+        total_loss.backward()
+        torch.nn.utils.clip_grad_norm_(self.parameters(), 0.25)
+        self.optimizer.step()
+        
+        return {
+            'action_loss': action_loss.item(),
+            'state_loss': state_loss.item(),
+            'return_loss': return_loss.item(),
+            'total_loss': total_loss.item()
+        }
+    
+    def save(self, path: str):
+        """Save model checkpoint."""
+        torch.save({
+            'state_dict': self.state_dict(),
+            'optimizer': self.optimizer.state_dict(),
+        }, path)
+    
+    def load(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path)
+        self.load_state_dict(checkpoint['state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer'])
 
 class DynamicStrategySelector:
     """Manages dynamic parallelism strategy selection and transitions."""
@@ -906,3 +1187,1396 @@ class DynamicStrategySelector:
             
         with open(filepath, 'w') as f:
             json.dump(history, f, indent=2)
+
+class DecisionTransformerSelector(DynamicStrategySelector):
+    """Wrapper class that uses Decision Transformer for dynamic strategy selection."""
+    
+    def __init__(self, 
+                 config: Dict,
+                 parallelism_manager: Optional[Any] = None):
+        super().__init__(config, parallelism_manager)
+        
+        # Initialize state and action dimensions
+        self.state_dim = self._get_state_dim()
+        self.action_dim = self._get_action_dim()
+        
+        # Initialize Decision Transformer
+        self.dt_model = DecisionTransformerStrategy(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            max_seq_length=20,  # Configurable
+            hidden_size=512,    # Configurable
+            n_layer=4,          # Configurable
+            n_head=8           # Configurable
+        )
+        
+        # Initialize experience buffer
+        self.experience_buffer = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'next_states': []
+        }
+        
+        # Training parameters
+        self.batch_size = 32
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.dt_model = self.dt_model.to(self.device)
+        
+    def _get_state_dim(self) -> int:
+        """Calculate state dimension based on monitored metrics."""
+        # State includes: throughput, memory usage, communication overhead, etc.
+        return 10  # Adjust based on your metrics
+        
+    def _get_action_dim(self) -> int:
+        """Calculate action dimension based on possible parallelism configurations."""
+        # Action includes: dp_size, tp_size, pp_size, micro_batch_size, etc.
+        return 5  # Adjust based on your action space
+        
+    def _state_to_tensor(self, state: Dict) -> torch.Tensor:
+        """Convert state dictionary to tensor."""
+        state_list = [
+            state['throughput'],
+            state['gpu_memory_used'],
+            state['communication_overhead'],
+            state['load_balance'],
+            state['pipeline_efficiency'],
+            state['tensor_parallel_efficiency'],
+            state['data_parallel_efficiency'],
+            state['num_gpus'],
+            state['model_size'],
+            state['batch_size']
+        ]
+        return torch.tensor(state_list, dtype=torch.float32, device=self.device)
+        
+    def _action_to_tensor(self, action: Dict) -> torch.Tensor:
+        """Convert action dictionary to tensor."""
+        action_list = [
+            action['data_parallel_size'],
+            action['tensor_parallel_size'],
+            action['pipeline_parallel_size'],
+            action['micro_batch_size'],
+            action['gradient_accumulation_steps']
+        ]
+        return torch.tensor(action_list, dtype=torch.float32, device=self.device)
+        
+    def _tensor_to_action(self, action_tensor: torch.Tensor) -> Dict:
+        """Convert action tensor to dictionary."""
+        return {
+            'data_parallel_size': int(action_tensor[0].item()),
+            'tensor_parallel_size': int(action_tensor[1].item()),
+            'pipeline_parallel_size': int(action_tensor[2].item()),
+            'micro_batch_size': int(action_tensor[3].item()),
+            'gradient_accumulation_steps': int(action_tensor[4].item())
+        }
+        
+    def select_strategy(self, 
+                       current_metrics: Dict,
+                       target_metrics: Optional[Dict] = None) -> Dict:
+        """Select next parallelism strategy using Decision Transformer."""
+        # Convert current state to tensor
+        current_state = self._state_to_tensor(current_metrics)
+        
+        # Get history of states and actions
+        states = torch.stack([self._state_to_tensor(s) for s in self.experience_buffer['states']])
+        actions = torch.stack([self._action_to_tensor(a) for a in self.experience_buffer['actions']])
+        rewards = torch.tensor(self.experience_buffer['rewards'], device=self.device).unsqueeze(-1)
+        
+        # Add batch dimension if needed
+        if len(states.shape) == 2:
+            states = states.unsqueeze(0)
+            actions = actions.unsqueeze(0)
+            rewards = rewards.unsqueeze(0)
+        
+        # Get target return if available
+        target_return = None
+        if target_metrics is not None:
+            target_return = torch.tensor(
+                target_metrics['target_throughput'],
+                device=self.device
+            ).unsqueeze(0)
+        
+        # Get action from Decision Transformer
+        with torch.no_grad():
+            action_tensor = self.dt_model.get_action(
+                states=states,
+                actions=actions,
+                rewards=rewards,
+                target_return=target_return
+            )
+        
+        # Convert action tensor to dictionary
+        selected_strategy = self._tensor_to_action(action_tensor)
+        
+        # Validate and adjust strategy if needed
+        selected_strategy = self._validate_strategy(selected_strategy)
+        
+        return selected_strategy
+        
+    def update(self, 
+               state: Dict,
+               action: Dict,
+               reward: float,
+               next_state: Dict):
+        """Update experience buffer and train Decision Transformer."""
+        # Add experience to buffer
+        self.experience_buffer['states'].append(state)
+        self.experience_buffer['actions'].append(action)
+        self.experience_buffer['rewards'].append(reward)
+        self.experience_buffer['next_states'].append(next_state)
+        
+        # Keep buffer size limited
+        max_buffer_size = 1000
+        if len(self.experience_buffer['states']) > max_buffer_size:
+            for key in self.experience_buffer:
+                self.experience_buffer[key] = self.experience_buffer[key][-max_buffer_size:]
+        
+        # Train if enough samples
+        if len(self.experience_buffer['states']) >= self.batch_size:
+            self._train_step()
+            
+    def _train_step(self):
+        """Perform one training step of the Decision Transformer."""
+        # Sample batch
+        indices = np.random.choice(
+            len(self.experience_buffer['states']),
+            size=self.batch_size
+        )
+        
+        batch = {
+            'states': torch.stack([
+                self._state_to_tensor(self.experience_buffer['states'][i])
+                for i in indices
+            ]),
+            'actions': torch.stack([
+                self._action_to_tensor(self.experience_buffer['actions'][i])
+                for i in indices
+            ]),
+            'rewards': torch.tensor(
+                [self.experience_buffer['rewards'][i] for i in indices],
+                device=self.device
+            ).unsqueeze(-1),
+            'next_states': torch.stack([
+                self._state_to_tensor(self.experience_buffer['next_states'][i])
+                for i in indices
+            ])
+        }
+        
+        # Train step
+        losses = self.dt_model.train_step(batch)
+        
+        # Log losses
+        logger.info(f"Training losses: {losses}")
+        
+    def save(self, path: str):
+        """Save Decision Transformer model and experience buffer."""
+        self.dt_model.save(f"{path}_model.pt")
+        torch.save(self.experience_buffer, f"{path}_buffer.pt")
+        
+    def load(self, path: str):
+        """Load Decision Transformer model and experience buffer."""
+        self.dt_model.load(f"{path}_model.pt")
+        self.experience_buffer = torch.load(f"{path}_buffer.pt")
+
+class PPOActor(nn.Module):
+    """Actor network for PPO."""
+    
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Mean and log std for continuous actions
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+        
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.network(state)
+        mean = self.mean(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+        
+    def sample(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        action = dist.rsample()  # Use reparameterization trick
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        return action, log_prob
+        
+    def evaluate(self, state: torch.Tensor, action: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        mean, std = self.forward(state)
+        dist = torch.distributions.Normal(mean, std)
+        log_prob = dist.log_prob(action).sum(dim=-1)
+        entropy = dist.entropy().mean()
+        return log_prob, entropy
+
+class PPOCritic(nn.Module):
+    """Critic network for PPO."""
+    
+    def __init__(self, state_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        return self.network(state)
+
+class PPOMemory:
+    """Memory buffer for PPO."""
+    
+    def __init__(self):
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.next_states = []
+        self.log_probs = []
+        self.values = []
+        self.dones = []
+        
+    def push(self, state, action, reward, next_state, log_prob, value, done):
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.next_states.append(next_state)
+        self.log_probs.append(log_prob)
+        self.values.append(value)
+        self.dones.append(done)
+        
+    def clear(self):
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.next_states.clear()
+        self.log_probs.clear()
+        self.values.clear()
+        self.dones.clear()
+        
+    def get_batch(self, device: torch.device) -> Dict[str, torch.Tensor]:
+        return {
+            'states': torch.FloatTensor(self.states).to(device),
+            'actions': torch.FloatTensor(self.actions).to(device),
+            'rewards': torch.FloatTensor(self.rewards).to(device),
+            'next_states': torch.FloatTensor(self.next_states).to(device),
+            'log_probs': torch.FloatTensor(self.log_probs).to(device),
+            'values': torch.FloatTensor(self.values).to(device),
+            'dones': torch.FloatTensor(self.dones).to(device)
+        }
+
+class PPOStrategySelector(DynamicStrategySelector):
+    """PPO-based strategy selector for dynamic parallelism."""
+    
+    def __init__(self, 
+                 config: Dict,
+                 parallelism_manager: Optional[Any] = None):
+        super().__init__(config, parallelism_manager)
+        
+        # Initialize dimensions
+        self.state_dim = self._get_state_dim()
+        self.action_dim = self._get_action_dim()
+        
+        # Initialize networks
+        self.actor = PPOActor(self.state_dim, self.action_dim)
+        self.critic = PPOCritic(self.state_dim)
+        
+        # Initialize optimizers
+        self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=3e-4)
+        self.critic_optimizer = torch.optim.Adam(self.critic.parameters(), lr=1e-3)
+        
+        # Initialize memory
+        self.memory = PPOMemory()
+        
+        # PPO hyperparameters
+        self.clip_param = 0.2
+        self.max_grad_norm = 0.5
+        self.ppo_epochs = 10
+        self.batch_size = 32
+        self.gamma = 0.99
+        self.gae_lambda = 0.95
+        
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.actor = self.actor.to(self.device)
+        self.critic = self.critic.to(self.device)
+        
+        # Metrics
+        self.training_step = 0
+        self.episode_rewards = []
+        
+    def _get_state_dim(self) -> int:
+        """Calculate state dimension."""
+        return 10  # Same as Decision Transformer
+        
+    def _get_action_dim(self) -> int:
+        """Calculate action dimension."""
+        return 5  # Same as Decision Transformer
+        
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize actions to valid ranges."""
+        # Clip and scale actions to valid ranges
+        action = torch.clamp(action, -1, 1)
+        
+        # Scale to actual ranges
+        scaled_action = torch.zeros_like(action)
+        
+        # Data parallel size (1 to max_gpus)
+        scaled_action[0] = (action[0] + 1) * self.config['max_gpus'] / 2
+        
+        # Tensor parallel size (1 to max_gpus)
+        scaled_action[1] = (action[1] + 1) * self.config['max_gpus'] / 2
+        
+        # Pipeline parallel size (1 to max_gpus)
+        scaled_action[2] = (action[2] + 1) * self.config['max_gpus'] / 2
+        
+        # Micro batch size (power of 2 between 1 and max_batch_size)
+        scaled_action[3] = 2 ** (((action[3] + 1) * 4))  # Scales to 1-32
+        
+        # Gradient accumulation steps (1 to 32)
+        scaled_action[4] = (action[4] + 1) * 16  # Scales to 1-32
+        
+        return scaled_action
+        
+    def select_strategy(self, 
+                       current_metrics: Dict,
+                       target_metrics: Optional[Dict] = None) -> Dict:
+        """Select next parallelism strategy using PPO."""
+        # Convert state to tensor
+        state = self._state_to_tensor(current_metrics)
+        
+        # Get action from actor
+        with torch.no_grad():
+            action, log_prob = self.actor.sample(state)
+            value = self.critic(state)
+        
+        # Normalize action
+        normalized_action = self._normalize_action(action)
+        
+        # Convert to strategy dict
+        strategy = {
+            'data_parallel_size': int(normalized_action[0].item()),
+            'tensor_parallel_size': int(normalized_action[1].item()),
+            'pipeline_parallel_size': int(normalized_action[2].item()),
+            'micro_batch_size': int(normalized_action[3].item()),
+            'gradient_accumulation_steps': int(normalized_action[4].item())
+        }
+        
+        # Store experience
+        self.last_state = state
+        self.last_action = action
+        self.last_log_prob = log_prob
+        self.last_value = value
+        
+        return strategy
+        
+    def update(self, 
+               state: Dict,
+               action: Dict,
+               reward: float,
+               next_state: Dict,
+               done: bool = False):
+        """Update PPO memory with transition."""
+        # Convert to tensors
+        state_tensor = self._state_to_tensor(state)
+        next_state_tensor = self._state_to_tensor(next_state)
+        action_tensor = self._action_to_tensor(action)
+        
+        # Store transition
+        self.memory.push(
+            state_tensor.cpu().numpy(),
+            action_tensor.cpu().numpy(),
+            reward,
+            next_state_tensor.cpu().numpy(),
+            self.last_log_prob.cpu().numpy(),
+            self.last_value.cpu().numpy(),
+            done
+        )
+        
+        # Train if episode is done
+        if done:
+            self.train()
+            
+    def train(self):
+        """Train PPO on collected experience."""
+        # Get batch data
+        batch = self.memory.get_batch(self.device)
+        
+        # Compute advantages
+        advantages = self._compute_advantages(
+            batch['rewards'],
+            batch['values'],
+            batch['dones']
+        )
+        
+        # Normalize advantages
+        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+        
+        # PPO update
+        for _ in range(self.ppo_epochs):
+            # Generate random mini-batches
+            batch_size = len(batch['states'])
+            indices = torch.randperm(batch_size)
+            
+            for start in range(0, batch_size, self.batch_size):
+                end = start + self.batch_size
+                mini_batch_indices = indices[start:end]
+                
+                mini_batch = {
+                    k: v[mini_batch_indices]
+                    for k, v in batch.items()
+                }
+                
+                # Evaluate actions
+                new_log_probs, entropy = self.actor.evaluate(
+                    mini_batch['states'],
+                    mini_batch['actions']
+                )
+                new_values = self.critic(mini_batch['states'])
+                
+                # Compute ratio
+                ratio = torch.exp(new_log_probs - mini_batch['log_probs'])
+                
+                # Compute surrogate losses
+                surr1 = ratio * advantages[mini_batch_indices]
+                surr2 = torch.clamp(
+                    ratio,
+                    1 - self.clip_param,
+                    1 + self.clip_param
+                ) * advantages[mini_batch_indices]
+                
+                # Compute actor loss
+                actor_loss = -torch.min(surr1, surr2).mean()
+                
+                # Compute critic loss
+                value_loss = F.mse_loss(
+                    new_values.squeeze(),
+                    mini_batch['rewards'] + self.gamma * (1 - mini_batch['dones']) * mini_batch['values']
+                )
+                
+                # Compute total loss
+                loss = actor_loss + 0.5 * value_loss - 0.01 * entropy
+                
+                # Update networks
+                self.actor_optimizer.zero_grad()
+                self.critic_optimizer.zero_grad()
+                loss.backward()
+                
+                # Clip gradients
+                torch.nn.utils.clip_grad_norm_(
+                    self.actor.parameters(),
+                    self.max_grad_norm
+                )
+                torch.nn.utils.clip_grad_norm_(
+                    self.critic.parameters(),
+                    self.max_grad_norm
+                )
+                
+                self.actor_optimizer.step()
+                self.critic_optimizer.step()
+        
+        # Clear memory
+        self.memory.clear()
+        
+    def _compute_advantages(self,
+                          rewards: torch.Tensor,
+                          values: torch.Tensor,
+                          dones: torch.Tensor) -> torch.Tensor:
+        """Compute advantages using GAE."""
+        advantages = torch.zeros_like(rewards)
+        last_advantage = 0
+        
+        for t in reversed(range(len(rewards))):
+            if t == len(rewards) - 1:
+                next_value = 0
+            else:
+                next_value = values[t + 1]
+                
+            delta = rewards[t] + self.gamma * next_value * (1 - dones[t]) - values[t]
+            advantages[t] = delta + self.gamma * self.gae_lambda * (1 - dones[t]) * last_advantage
+            last_advantage = advantages[t]
+            
+        return advantages
+        
+    def _state_to_tensor(self, state: Dict) -> torch.Tensor:
+        """Convert state dictionary to tensor."""
+        state_list = [
+            state['throughput'],
+            state['gpu_memory_used'],
+            state['communication_overhead'],
+            state['load_balance'],
+            state['pipeline_efficiency'],
+            state['tensor_parallel_efficiency'],
+            state['data_parallel_efficiency'],
+            state['num_gpus'],
+            state['model_size'],
+            state['batch_size']
+        ]
+        return torch.FloatTensor(state_list).to(self.device)
+        
+    def _action_to_tensor(self, action: Dict) -> torch.Tensor:
+        """Convert action dictionary to tensor."""
+        action_list = [
+            action['data_parallel_size'],
+            action['tensor_parallel_size'],
+            action['pipeline_parallel_size'],
+            action['micro_batch_size'],
+            action['gradient_accumulation_steps']
+        ]
+        return torch.FloatTensor(action_list).to(self.device)
+        
+    def save(self, path: str):
+        """Save PPO models."""
+        torch.save({
+            'actor_state_dict': self.actor.state_dict(),
+            'critic_state_dict': self.critic.state_dict(),
+            'actor_optimizer_state_dict': self.actor_optimizer.state_dict(),
+            'critic_optimizer_state_dict': self.critic_optimizer.state_dict(),
+            'training_step': self.training_step,
+            'episode_rewards': self.episode_rewards
+        }, path)
+        
+    def load(self, path: str):
+        """Load PPO models."""
+        checkpoint = torch.load(path)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic.load_state_dict(checkpoint['critic_state_dict'])
+        self.actor_optimizer.load_state_dict(checkpoint['actor_optimizer_state_dict'])
+        self.critic_optimizer.load_state_dict(checkpoint['critic_optimizer_state_dict'])
+        self.training_step = checkpoint['training_step']
+        self.episode_rewards = checkpoint['episode_rewards']
+
+class DPOStrategyModel(nn.Module):
+    """DPO model for strategy selection."""
+    
+    def __init__(self, 
+                 state_dim: int,
+                 action_dim: int,
+                 hidden_dim: int = 256):
+        super().__init__()
+        
+        self.state_encoder = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        self.action_encoder = nn.Sequential(
+            nn.Linear(action_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        self.joint_encoder = nn.Sequential(
+            nn.Linear(2 * hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, 1)
+        )
+        
+    def forward(self, 
+                states: torch.Tensor,
+                actions: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass computing preference logits.
+        
+        Args:
+            states: Tensor of shape (batch_size, state_dim)
+            actions: Tensor of shape (batch_size, action_dim)
+            
+        Returns:
+            Tensor of shape (batch_size, 1) with preference logits
+        """
+        state_emb = self.state_encoder(states)
+        action_emb = self.action_encoder(actions)
+        joint_emb = torch.cat([state_emb, action_emb], dim=-1)
+        return self.joint_encoder(joint_emb)
+
+class PreferenceDataset(Dataset):
+    """Dataset for preference learning."""
+    
+    def __init__(self, 
+                 states: List[Dict],
+                 chosen_actions: List[Dict],
+                 rejected_actions: List[Dict]):
+        self.states = states
+        self.chosen_actions = chosen_actions
+        self.rejected_actions = rejected_actions
+        
+    def __len__(self) -> int:
+        return len(self.states)
+        
+    def __getitem__(self, idx: int) -> Tuple[Dict, Dict, Dict]:
+        return (
+            self.states[idx],
+            self.chosen_actions[idx],
+            self.rejected_actions[idx]
+        )
+
+class DPOStrategySelector(DynamicStrategySelector):
+    """DPO-based strategy selector for dynamic parallelism."""
+    
+    def __init__(self, 
+                 config: Dict,
+                 parallelism_manager: Optional[Any] = None,
+                 beta: float = 0.1,
+                 reference_model: Optional[nn.Module] = None):
+        super().__init__(config, parallelism_manager)
+        
+        # Initialize dimensions
+        self.state_dim = self._get_state_dim()
+        self.action_dim = self._get_action_dim()
+        
+        # Initialize DPO model
+        self.model = DPOStrategyModel(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim
+        )
+        
+        # Initialize reference model (can be a copy of initial model)
+        self.reference_model = reference_model or copy.deepcopy(self.model)
+        
+        # Freeze reference model
+        for param in self.reference_model.parameters():
+            param.requires_grad = False
+            
+        # DPO hyperparameters
+        self.beta = beta  # Temperature parameter
+        self.batch_size = 32
+        self.learning_rate = 1e-4
+        
+        # Initialize optimizer
+        self.optimizer = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.learning_rate,
+            weight_decay=0.01
+        )
+        
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = self.model.to(self.device)
+        self.reference_model = self.reference_model.to(self.device)
+        
+        # Preference buffer
+        self.preference_buffer = {
+            'states': [],
+            'chosen_actions': [],
+            'rejected_actions': []
+        }
+        
+    def _get_state_dim(self) -> int:
+        """Calculate state dimension."""
+        return 10  # Same as previous implementations
+        
+    def _get_action_dim(self) -> int:
+        """Calculate action dimension."""
+        return 5  # Same as previous implementations
+        
+    def select_strategy(self, 
+                       current_metrics: Dict,
+                       target_metrics: Optional[Dict] = None) -> Dict:
+        """Select next parallelism strategy using DPO."""
+        # Convert state to tensor
+        state = self._state_to_tensor(current_metrics).unsqueeze(0)
+        
+        # Generate multiple candidate actions
+        num_candidates = 10
+        candidates = []
+        scores = []
+        
+        for _ in range(num_candidates):
+            # Sample random action
+            action = torch.randn(1, self.action_dim, device=self.device)
+            normalized_action = self._normalize_action(action)
+            
+            # Score action using model
+            with torch.no_grad():
+                score = self.model(state, normalized_action)
+                
+            candidates.append(normalized_action)
+            scores.append(score.item())
+            
+        # Select best action
+        best_idx = np.argmax(scores)
+        best_action = candidates[best_idx]
+        
+        # Convert to strategy dict
+        strategy = {
+            'data_parallel_size': int(best_action[0, 0].item()),
+            'tensor_parallel_size': int(best_action[0, 1].item()),
+            'pipeline_parallel_size': int(best_action[0, 2].item()),
+            'micro_batch_size': int(best_action[0, 3].item()),
+            'gradient_accumulation_steps': int(best_action[0, 4].item())
+        }
+        
+        return strategy
+        
+    def add_preference(self,
+                      state: Dict,
+                      chosen_action: Dict,
+                      rejected_action: Dict):
+        """Add a preference pair to the buffer."""
+        self.preference_buffer['states'].append(state)
+        self.preference_buffer['chosen_actions'].append(chosen_action)
+        self.preference_buffer['rejected_actions'].append(rejected_action)
+        
+    def train_step(self):
+        """Perform one training step using DPO."""
+        if len(self.preference_buffer['states']) < self.batch_size:
+            return
+            
+        # Create dataset
+        dataset = PreferenceDataset(
+            states=self.preference_buffer['states'],
+            chosen_actions=self.preference_buffer['chosen_actions'],
+            rejected_actions=self.preference_buffer['rejected_actions']
+        )
+        
+        # Create dataloader
+        dataloader = DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True
+        )
+        
+        total_loss = 0
+        num_batches = 0
+        
+        for batch in dataloader:
+            states, chosen_actions, rejected_actions = batch
+            
+            # Convert to tensors
+            states = torch.stack([self._state_to_tensor(s) for s in states])
+            chosen_actions = torch.stack([self._action_to_tensor(a) for a in chosen_actions])
+            rejected_actions = torch.stack([self._action_to_tensor(a) for a in rejected_actions])
+            
+            # Get logits from policy and reference model
+            policy_chosen_logits = self.model(states, chosen_actions)
+            policy_rejected_logits = self.model(states, rejected_actions)
+            
+            with torch.no_grad():
+                ref_chosen_logits = self.reference_model(states, chosen_actions)
+                ref_rejected_logits = self.reference_model(states, rejected_actions)
+            
+            # Compute DPO loss
+            chosen_rewards = policy_chosen_logits - ref_chosen_logits
+            rejected_rewards = policy_rejected_logits - ref_rejected_logits
+            
+            loss = -torch.nn.functional.logsigmoid(
+                self.beta * (chosen_rewards - rejected_rewards)
+            ).mean()
+            
+            # Update model
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            self.optimizer.step()
+            
+            total_loss += loss.item()
+            num_batches += 1
+            
+        # Log average loss
+        if num_batches > 0:
+            avg_loss = total_loss / num_batches
+            logger.info(f"DPO training loss: {avg_loss:.4f}")
+            
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize actions to valid ranges."""
+        # Same as PPO implementation
+        action = torch.clamp(action, -1, 1)
+        scaled_action = torch.zeros_like(action)
+        
+        scaled_action[..., 0] = (action[..., 0] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 1] = (action[..., 1] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 2] = (action[..., 2] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 3] = 2 ** (((action[..., 3] + 1) * 4))
+        scaled_action[..., 4] = (action[..., 4] + 1) * 16
+        
+        return scaled_action
+        
+    def _state_to_tensor(self, state: Dict) -> torch.Tensor:
+        """Convert state dictionary to tensor."""
+        state_list = [
+            state['throughput'],
+            state['gpu_memory_used'],
+            state['communication_overhead'],
+            state['load_balance'],
+            state['pipeline_efficiency'],
+            state['tensor_parallel_efficiency'],
+            state['data_parallel_efficiency'],
+            state['num_gpus'],
+            state['model_size'],
+            state['batch_size']
+        ]
+        return torch.FloatTensor(state_list).to(self.device)
+        
+    def _action_to_tensor(self, action: Dict) -> torch.Tensor:
+        """Convert action dictionary to tensor."""
+        action_list = [
+            action['data_parallel_size'],
+            action['tensor_parallel_size'],
+            action['pipeline_parallel_size'],
+            action['micro_batch_size'],
+            action['gradient_accumulation_steps']
+        ]
+        return torch.FloatTensor(action_list).to(self.device)
+        
+    def save(self, path: str):
+        """Save DPO models."""
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'reference_model_state_dict': self.reference_model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'preference_buffer': self.preference_buffer
+        }, path)
+        
+    def load(self, path: str):
+        """Load DPO models."""
+        checkpoint = torch.load(path)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.reference_model.load_state_dict(checkpoint['reference_model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.preference_buffer = checkpoint['preference_buffer']
+
+class GRPOStrategy:
+    """Group Relative Policy Optimization implementation for dynamic parallelism strategy selection."""
+    
+    def __init__(self, 
+                 state_dim: int,
+                 action_dim: int,
+                 hidden_dim: int = 256,
+                 learning_rate: float = 3e-4,
+                 group_size: int = 16,
+                 epsilon: float = 0.2):
+        super().__init__()
+        
+        # Network architecture
+        self.policy_network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, action_dim)
+        )
+        
+        # Hyperparameters
+        self.group_size = group_size
+        self.epsilon = epsilon
+        self.optimizer = torch.optim.Adam(self.policy_network.parameters(), lr=learning_rate)
+        
+        # Memory buffers
+        self.states = []
+        self.actions = []
+        self.rewards = []
+        self.log_probs = []
+        
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(self.device)
+    
+    def forward(self, state: torch.Tensor) -> torch.Tensor:
+        """Forward pass through the policy network."""
+        return F.softmax(self.policy_network(state), dim=-1)
+    
+    def select_action(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Select an action using the policy network."""
+        state = state.to(self.device)
+        action_probs = self.forward(state)
+        dist = torch.distributions.Categorical(action_probs)
+        action = dist.sample()
+        log_prob = dist.log_prob(action)
+        
+        return action, log_prob
+    
+    def store_transition(self, state: torch.Tensor, action: torch.Tensor, 
+                        reward: float, log_prob: torch.Tensor):
+        """Store a transition in memory."""
+        self.states.append(state)
+        self.actions.append(action)
+        self.rewards.append(reward)
+        self.log_probs.append(log_prob)
+    
+    def compute_group_advantages(self, rewards: torch.Tensor) -> torch.Tensor:
+        """Compute advantages based on group comparisons."""
+        group_rewards = rewards.view(-1, self.group_size)
+        group_means = group_rewards.mean(dim=1, keepdim=True)
+        group_stds = group_rewards.std(dim=1, keepdim=True).clamp(min=1e-6)
+        
+        # Normalize rewards within each group
+        advantages = (group_rewards - group_means) / group_stds
+        return advantages.view(-1)
+    
+    def train_step(self) -> Dict[str, float]:
+        """Perform one training step using GRPO."""
+        if len(self.states) < self.group_size:
+            return {"policy_loss": 0.0, "mean_reward": 0.0}
+            
+        # Prepare batch data
+        states = torch.stack(self.states)
+        actions = torch.stack(self.actions)
+        rewards = torch.tensor(self.rewards, device=self.device)
+        old_log_probs = torch.stack(self.log_probs)
+        
+        # Compute advantages using group comparisons
+        advantages = self.compute_group_advantages(rewards)
+        
+        # Get current action probabilities
+        action_probs = self.forward(states)
+        dist = torch.distributions.Categorical(action_probs)
+        new_log_probs = dist.log_prob(actions)
+        
+        # Compute probability ratio and clipped ratio
+        ratio = torch.exp(new_log_probs - old_log_probs)
+        clipped_ratio = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon)
+        
+        # Compute policy loss using the minimum of clipped and unclipped objectives
+        policy_loss = -torch.min(
+            ratio * advantages,
+            clipped_ratio * advantages
+        ).mean()
+        
+        # Update policy network
+        self.optimizer.zero_grad()
+        policy_loss.backward()
+        self.optimizer.step()
+        
+        # Clear memory buffers
+        self.states.clear()
+        self.actions.clear()
+        self.rewards.clear()
+        self.log_probs.clear()
+        
+        return {
+            "policy_loss": policy_loss.item(),
+            "mean_reward": rewards.mean().item()
+        }
+    
+    def save(self, path: str):
+        """Save model checkpoint."""
+        torch.save({
+            'policy_network_state_dict': self.policy_network.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, path)
+    
+    def load(self, path: str):
+        """Load model checkpoint."""
+        checkpoint = torch.load(path)
+        self.policy_network.load_state_dict(checkpoint['policy_network_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        
+    def to(self, device: torch.device):
+        """Move the model to specified device."""
+        self.policy_network = self.policy_network.to(device)
+        return self
+
+class GRPOSelector:
+    """Wrapper class that uses GRPO for dynamic strategy selection."""
+    
+    def __init__(self, 
+                 config: Dict,
+                 parallelism_manager: Optional[Any] = None):
+        super().__init__(config, parallelism_manager)
+        
+        # Initialize state and action dimensions
+        self.state_dim = self._get_state_dim()
+        self.action_dim = self._get_action_dim()
+        
+        # Initialize GRPO model
+        self.grpo_model = GRPOStrategy(
+            state_dim=self.state_dim,
+            action_dim=self.action_dim,
+            hidden_dim=256,
+            group_size=16
+        )
+        
+        # Training parameters
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.grpo_model = self.grpo_model.to(self.device)
+        
+        # Metrics tracking
+        self.episode_rewards = []
+        self.training_stats = {
+            'policy_losses': [],
+            'mean_rewards': []
+        }
+    
+    def _get_state_dim(self) -> int:
+        """Calculate state dimension based on monitored metrics."""
+        # State includes: throughput, GPU utilization, memory usage, communication overhead, etc.
+        return 8
+    
+    def _get_action_dim(self) -> int:
+        """Calculate action dimension based on possible parallelism configurations."""
+        # Actions represent different parallelism strategies
+        return 5
+    
+    def _state_to_tensor(self, state: Dict) -> torch.Tensor:
+        """Convert state dictionary to tensor."""
+        state_list = [
+            state['throughput'],
+            state['gpu_utilization'],
+            state['memory_used'],
+            state['communication_overhead'],
+            state['pipeline_efficiency'],
+            state['load_balance'],
+            state['gradient_sync_time'],
+            state['batch_time']
+        ]
+        return torch.tensor(state_list, dtype=torch.float32).to(self.device)
+    
+    def _action_to_config(self, action: int) -> Dict:
+        """Convert action to parallelism configuration."""
+        configs = {
+            0: {'type': 'data_parallel', 'size': 2},
+            1: {'type': 'tensor_parallel', 'size': 2},
+            2: {'type': 'pipeline_parallel', 'size': 2},
+            3: {'type': 'hybrid_dp_tp', 'sizes': [2, 2]},
+            4: {'type': 'hybrid_all', 'sizes': [2, 2, 2]}
+        }
+        return configs[action]
+    
+    def select_strategy(self, 
+                       current_metrics: Dict,
+                       target_metrics: Optional[Dict] = None) -> Dict:
+        """Select next parallelism strategy using GRPO."""
+        # Convert current state to tensor
+        state = self._state_to_tensor(current_metrics)
+        
+        # Select action using GRPO
+        action, log_prob = self.grpo_model.select_action(state)
+        
+        # Convert action to configuration
+        config = self._action_to_config(action.item())
+        
+        # Store transition for later training
+        self.last_state = state
+        self.last_action = action
+        self.last_log_prob = log_prob
+        
+        return config
+    
+    def update(self, 
+               state: Dict,
+               action: Dict,
+               reward: float,
+               next_state: Dict):
+        """Store transition and train GRPO model."""
+        # Store transition
+        self.grpo_model.store_transition(
+            self.last_state,
+            self.last_action,
+            reward,
+            self.last_log_prob
+        )
+        
+        # Train model if enough samples are collected
+        stats = self.grpo_model.train_step()
+        
+        # Update training statistics
+        self.training_stats['policy_losses'].append(stats['policy_loss'])
+        self.training_stats['mean_rewards'].append(stats['mean_reward'])
+        self.episode_rewards.append(reward)
+    
+    def save(self, path: str):
+        """Save GRPO model and training statistics."""
+        self.grpo_model.save(path + '_model.pt')
+        torch.save({
+            'training_stats': self.training_stats,
+            'episode_rewards': self.episode_rewards
+        }, path + '_stats.pt')
+    
+    def load(self, path: str):
+        """Load GRPO model and training statistics."""
+        self.grpo_model.load(path + '_model.pt')
+        stats = torch.load(path + '_stats.pt')
+        self.training_stats = stats['training_stats']
+        self.episode_rewards = stats['episode_rewards']
+
+class GRPOPolicy(nn.Module):
+    """Policy network for GRPO."""
+    
+    def __init__(self, 
+                 state_dim: int,
+                 action_dim: int,
+                 hidden_dim: int = 256):
+        super().__init__()
+        
+        self.network = nn.Sequential(
+            nn.Linear(state_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.ReLU()
+        )
+        
+        # Mean and log std for continuous actions
+        self.mean = nn.Linear(hidden_dim, action_dim)
+        self.log_std = nn.Parameter(torch.zeros(1, action_dim))
+        
+    def forward(self, state: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.network(state)
+        mean = self.mean(x)
+        std = self.log_std.exp().expand_as(mean)
+        return mean, std
+        
+    def get_distribution(self, state: torch.Tensor) -> torch.distributions.Normal:
+        """Get action distribution for a given state."""
+        mean, std = self.forward(state)
+        return torch.distributions.Normal(mean, std)
+        
+    def sample_group(self, 
+                    state: torch.Tensor,
+                    group_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Sample a group of actions and compute their log probabilities."""
+        dist = self.get_distribution(state)
+        
+        # Sample group_size actions
+        actions = dist.rsample((group_size,))  # Shape: [G, B, action_dim]
+        log_probs = dist.log_prob(actions).sum(dim=-1)  # Shape: [G, B]
+        
+        return actions, log_probs
+
+class GRPOStrategySelector(DynamicStrategySelector):
+    """GRPO-based strategy selector for dynamic parallelism."""
+    
+    def __init__(self, 
+                 config: Dict,
+                 parallelism_manager: Optional[Any] = None,
+                 group_size: int = 8,
+                 epsilon: float = 0.2,
+                 beta: float = 0.01):
+        super().__init__(config, parallelism_manager)
+        
+        # Initialize dimensions
+        self.state_dim = self._get_state_dim()
+        self.action_dim = self._get_action_dim()
+        
+        # Initialize policy and reference policy
+        self.policy = GRPOPolicy(self.state_dim, self.action_dim)
+        self.old_policy = copy.deepcopy(self.policy)
+        self.ref_policy = copy.deepcopy(self.policy)  # Initial reference policy
+        
+        # Freeze reference policy
+        for param in self.ref_policy.parameters():
+            param.requires_grad = False
+            
+        # GRPO hyperparameters
+        self.group_size = group_size
+        self.epsilon = epsilon  # Clipping parameter
+        self.beta = beta       # KL penalty coefficient
+        self.learning_rate = 1e-4
+        
+        # Initialize optimizer
+        self.optimizer = torch.optim.Adam(
+            self.policy.parameters(),
+            lr=self.learning_rate
+        )
+        
+        # Device
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.policy = self.policy.to(self.device)
+        self.old_policy = self.old_policy.to(self.device)
+        self.ref_policy = self.ref_policy.to(self.device)
+        
+        # Experience buffer
+        self.buffer = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'log_probs': []
+        }
+        
+    def _get_state_dim(self) -> int:
+        """Calculate state dimension."""
+        return 10  # Same as previous implementations
+        
+    def _get_action_dim(self) -> int:
+        """Calculate action dimension."""
+        return 5  # Same as previous implementations
+        
+    def select_strategy(self, 
+                       current_metrics: Dict,
+                       target_metrics: Optional[Dict] = None) -> Dict:
+        """Select next parallelism strategy using GRPO."""
+        # Convert state to tensor
+        state = self._state_to_tensor(current_metrics).unsqueeze(0)
+        
+        # Sample group of actions
+        with torch.no_grad():
+            actions, log_probs = self.policy.sample_group(
+                state,
+                self.group_size
+            )
+            
+        # Evaluate each action and get rewards
+        rewards = []
+        strategies = []
+        
+        for i in range(self.group_size):
+            # Normalize action
+            norm_action = self._normalize_action(actions[i])
+            
+            # Convert to strategy dict
+            strategy = {
+                'data_parallel_size': int(norm_action[0, 0].item()),
+                'tensor_parallel_size': int(norm_action[0, 1].item()),
+                'pipeline_parallel_size': int(norm_action[0, 2].item()),
+                'micro_batch_size': int(norm_action[0, 3].item()),
+                'gradient_accumulation_steps': int(norm_action[0, 4].item())
+            }
+            
+            # Evaluate strategy (this should be implemented based on your metrics)
+            reward = self._evaluate_strategy(strategy, current_metrics)
+            
+            rewards.append(reward)
+            strategies.append(strategy)
+            
+        # Select best strategy
+        best_idx = np.argmax(rewards)
+        best_strategy = strategies[best_idx]
+        
+        # Store experience
+        self.buffer['states'].append(state.cpu().numpy())
+        self.buffer['actions'].append(actions.cpu().numpy())
+        self.buffer['rewards'].append(rewards)
+        self.buffer['log_probs'].append(log_probs.cpu().numpy())
+        
+        return best_strategy
+        
+    def train_step(self):
+        """Perform one training step using GRPO."""
+        if len(self.buffer['states']) == 0:
+            return
+            
+        # Convert buffer to tensors
+        states = torch.FloatTensor(np.concatenate(self.buffer['states'])).to(self.device)
+        actions = torch.FloatTensor(np.concatenate(self.buffer['actions'])).to(self.device)
+        old_log_probs = torch.FloatTensor(np.concatenate(self.buffer['log_probs'])).to(self.device)
+        rewards = torch.FloatTensor(self.buffer['rewards']).to(self.device)
+        
+        # Compute advantages using group statistics
+        advantages = []
+        for group_rewards in rewards:
+            group_mean = group_rewards.mean()
+            group_std = group_rewards.std()
+            group_advantages = (group_rewards - group_mean) / (group_std + 1e-8)
+            advantages.append(group_advantages)
+            
+        advantages = torch.cat(advantages)
+        
+        # GRPO update
+        for _ in range(10):  # Number of optimization epochs
+            # Get current policy distribution
+            current_dist = self.policy.get_distribution(states)
+            ref_dist = self.ref_policy.get_distribution(states)
+            
+            # Compute log probabilities
+            log_probs = current_dist.log_prob(actions).sum(dim=-1)
+            
+            # Compute probability ratio
+            ratio = torch.exp(log_probs - old_log_probs)
+            
+            # Compute surrogate losses
+            surr1 = ratio * advantages
+            surr2 = torch.clamp(ratio, 1 - self.epsilon, 1 + self.epsilon) * advantages
+            
+            # Compute KL divergence with reference policy
+            kl_div = torch.distributions.kl_divergence(current_dist, ref_dist).mean()
+            
+            # Compute total loss
+            policy_loss = -torch.min(surr1, surr2).mean()
+            total_loss = policy_loss + self.beta * kl_div
+            
+            # Update policy
+            self.optimizer.zero_grad()
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy.parameters(), 0.5)
+            self.optimizer.step()
+            
+            # Early stopping if KL divergence is too large
+            if kl_div > 0.015:
+                break
+                
+        # Update old policy
+        self.old_policy.load_state_dict(self.policy.state_dict())
+        
+        # Clear buffer
+        self.buffer = {
+            'states': [],
+            'actions': [],
+            'rewards': [],
+            'log_probs': []
+        }
+        
+    def _evaluate_strategy(self, 
+                          strategy: Dict,
+                          current_metrics: Dict) -> float:
+        """Evaluate a strategy and return a reward."""
+        # Implement your reward function here
+        # This should consider:
+        # 1. Throughput improvement
+        # 2. Memory efficiency
+        # 3. Communication overhead
+        # 4. Load balance
+        # Example simple reward:
+        reward = (
+            0.4 * (strategy['data_parallel_size'] / self.config['max_gpus']) +
+            0.3 * (strategy['tensor_parallel_size'] / self.config['max_gpus']) +
+            0.2 * (strategy['pipeline_parallel_size'] / self.config['max_gpus']) +
+            0.1 * (np.log2(strategy['micro_batch_size']) / 5)
+        )
+        return reward
+        
+    def _normalize_action(self, action: torch.Tensor) -> torch.Tensor:
+        """Normalize actions to valid ranges."""
+        # Same as previous implementations
+        action = torch.clamp(action, -1, 1)
+        scaled_action = torch.zeros_like(action)
+        
+        scaled_action[..., 0] = (action[..., 0] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 1] = (action[..., 1] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 2] = (action[..., 2] + 1) * self.config['max_gpus'] / 2
+        scaled_action[..., 3] = 2 ** (((action[..., 3] + 1) * 4))
+        scaled_action[..., 4] = (action[..., 4] + 1) * 16
+        
+        return scaled_action
+        
+    def _state_to_tensor(self, state: Dict) -> torch.Tensor:
+        """Convert state dictionary to tensor."""
+        state_list = [
+            state['throughput'],
+            state['gpu_memory_used'],
+            state['communication_overhead'],
+            state['load_balance'],
+            state['pipeline_efficiency'],
+            state['tensor_parallel_efficiency'],
+            state['data_parallel_efficiency'],
+            state['num_gpus'],
+            state['model_size'],
+            state['batch_size']
+        ]
+        return torch.FloatTensor(state_list).to(self.device)
+        
+    def save(self, path: str):
+        """Save GRPO models."""
+        torch.save({
+            'policy_state_dict': self.policy.state_dict(),
+            'old_policy_state_dict': self.old_policy.state_dict(),
+            'ref_policy_state_dict': self.ref_policy.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict()
+        }, path)
+        
+    def load(self, path: str):
+        """Load GRPO models."""
+        checkpoint = torch.load(path)
+        self.policy.load_state_dict(checkpoint['policy_state_dict'])
+        self.old_policy.load_state_dict(checkpoint['old_policy_state_dict'])
+        self.ref_policy.load_state_dict(checkpoint['ref_policy_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
